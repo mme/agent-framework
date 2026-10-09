@@ -18,11 +18,10 @@ from typing import Any, cast
 from ag_ui.core import (
     BaseEvent,
     MessagesSnapshotEvent,
-    RunStartedEvent,
     StateSnapshotEvent,
 )
 
-from ._run_common import _build_run_finished_event
+from ._run_common import _build_run_finished_event, _build_run_started_event
 from ._snapshots import (
     AGUIThreadSnapshot,
     AGUIThreadSnapshotStore,
@@ -96,7 +95,7 @@ class ThreadSnapshotSession:
 
     async def hydrate_events(self, *, run_id: str) -> AsyncGenerator[BaseEvent]:
         """Replay the stored snapshot as a complete run without invoking the agent."""
-        yield RunStartedEvent(run_id=run_id, thread_id=self._thread_id)
+        yield _build_run_started_event(run_id, self._thread_id)
         snapshot = self._stored
         if snapshot is None:
             yield _build_run_finished_event(run_id=run_id, thread_id=self._thread_id)

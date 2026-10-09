@@ -18,7 +18,6 @@ from ag_ui.core import (
     CustomEvent,
     MessagesSnapshotEvent,
     RunErrorEvent,
-    RunStartedEvent,
     StateSnapshotEvent,
     TextMessageContentEvent,
     TextMessageEndEvent,
@@ -97,6 +96,7 @@ from ._run_common import (
     _approval_interrupt_for_function_call,  # type: ignore
     _approval_steps_response_schema,  # type: ignore
     _build_run_finished_event,  # type: ignore
+    _build_run_started_event,  # type: ignore
     _cancelled_resume_interrupt_ids,  # type: ignore
     _close_reasoning_block,  # type: ignore
     _emit_content,  # type: ignore
@@ -753,7 +753,7 @@ def _run_start_events(
     resolved_approval_results: list[Content],
 ) -> list[BaseEvent]:
     """Build the events that open an agent run: RUN_STARTED, PredictState, initial state, and approval results."""
-    events: list[BaseEvent] = [RunStartedEvent(run_id=run_id, thread_id=thread_id)]
+    events: list[BaseEvent] = [_build_run_started_event(run_id, thread_id)]
     if predict_state_config:
         predict_state_value = [
             {
@@ -2992,7 +2992,7 @@ async def _run_agent_stream(
             resume_payload, translated_message_ids, legacy_resume_error = legacy_resume
             raw_messages[:] = [message for message in raw_messages if id(message) not in translated_message_ids]
             if legacy_resume_error is not None:
-                yield RunStartedEvent(run_id=run_id, thread_id=thread_id)
+                yield _build_run_started_event(run_id, thread_id)
                 yield RunErrorEvent(message=legacy_resume_error, code="APPROVAL_RESUME_INVALID")
                 return
     approval_resume_messages, handled_resume_ids, cancelled_resume_ids, resume_error = (
@@ -3011,7 +3011,7 @@ async def _run_agent_stream(
         )
     )
     if resume_error is not None:
-        yield RunStartedEvent(run_id=run_id, thread_id=thread_id)
+        yield _build_run_started_event(run_id, thread_id)
         resume_error_code = getattr(resume_error, "code", None)
         should_clear_tool_approval_state = resume_error_code == "APPROVAL_RESUME_CANCELLED" or (
             resume_error_code == "APPROVAL_RESUME_NOT_FOUND"
@@ -3062,7 +3062,7 @@ async def _run_agent_stream(
         # Fully handled via retained results. Reconstruction may have refilled
         # ``raw_messages`` with the stored transcript on a client-replayed retry;
         # do not fall through to a fresh agent run (#8140 / eavan review).
-        yield RunStartedEvent(run_id=run_id, thread_id=thread_id)
+        yield _build_run_started_event(run_id, thread_id)
         for event in _make_approval_tool_result_events(retained_approval_results):
             yield event
         yield _build_run_finished_event(run_id=run_id, thread_id=thread_id)
@@ -3095,7 +3095,7 @@ async def _run_agent_stream(
     # Handle empty messages (emit RunStarted immediately since no agent response)
     if not messages and not only_cancelled_resume:
         logger.warning("No messages provided in AG-UI input")
-        yield RunStartedEvent(run_id=run_id, thread_id=thread_id)
+        yield _build_run_started_event(run_id, thread_id)
         yield _build_run_finished_event(run_id=run_id, thread_id=thread_id)
         return
 
@@ -3233,7 +3233,7 @@ async def _run_agent_stream(
         )
 
     if only_cancelled_resume:
-        yield RunStartedEvent(run_id=run_id, thread_id=thread_id)
+        yield _build_run_started_event(run_id, thread_id)
         _clear_tool_approval_state(approval_state_store, approval_thread_id)
         retired_interrupt_ids = {
             reconciliation.interrupt_id
@@ -3333,7 +3333,7 @@ async def _run_agent_stream(
         for intent in authorized_executions.values():
             approval_state_store.lifecycle.release_claim(intent, policy=ClaimRecoveryPolicy.SAFE_TO_RETRY)
         unavailable_names = ", ".join(sorted({intent.name for intent in unavailable_local_intents}))
-        yield RunStartedEvent(run_id=run_id, thread_id=thread_id)
+        yield _build_run_started_event(run_id, thread_id)
         yield RunErrorEvent(
             message=f"Approved tool(s) {unavailable_names} are temporarily unavailable; retry the approval later.",
             code="APPROVAL_TOOL_UNAVAILABLE",
@@ -3380,7 +3380,7 @@ async def _run_agent_stream(
         }
         if retired_interrupt_ids:
             await snapshot_session.clear_interrupts(interrupt_ids=retired_interrupt_ids)
-        yield RunStartedEvent(run_id=run_id, thread_id=thread_id)
+        yield _build_run_started_event(run_id, thread_id)
         yield RunErrorEvent(
             message="Function invocation is disabled; the approved tool remains pending for an explicit retry.",
             code="APPROVAL_INVOCATION_DISABLED",
@@ -3453,7 +3453,7 @@ async def _run_agent_stream(
         return combined or None
 
     if replacement_approval_requests:
-        yield RunStartedEvent(run_id=run_id, thread_id=thread_id)
+        yield _build_run_started_event(run_id, thread_id)
         for request in replacement_approval_requests:
             for event in _emit_content(
                 request,
@@ -3512,7 +3512,7 @@ async def _run_agent_stream(
         confirm_remaining_interrupts = remaining_stored_interrupts(
             {str(confirm_interrupt_id)} if confirm_interrupt_id else set()
         )
-        yield RunStartedEvent(run_id=run_id, thread_id=thread_id)
+        yield _build_run_started_event(run_id, thread_id)
         # Emit approved state snapshot before confirmation message
         if approved_state_snapshot_emitted:
             yield StateSnapshotEvent(snapshot=flow.current_state)
@@ -3770,7 +3770,7 @@ async def _run_agent_stream(
         stream_completed = True
     except ApprovalInvocationDisabledError:
         if not run_started_emitted:
-            yield RunStartedEvent(run_id=run_id, thread_id=thread_id)
+            yield _build_run_started_event(run_id, thread_id)
         yield RunErrorEvent(
             message="Function invocation is disabled; the approved tool remains pending for an explicit retry.",
             code="APPROVAL_INVOCATION_DISABLED",

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from agent_framework import AgentResponseUpdate, Content, WorkflowBuilder, WorkflowContext, executor
 from conftest import StubAgent  # pyrefly: ignore[missing-import] # pyright: ignore[reportMissingImports]
 from fastapi import FastAPI
@@ -20,6 +21,7 @@ from sse_helpers import (  # pyrefly: ignore[missing-import] # pyright: ignore[r
 )
 
 from agent_framework_ag_ui import AgentFrameworkAgent, AgentFrameworkWorkflow, add_agent_framework_fastapi_endpoint
+from agent_framework_ag_ui._utils import _AGUI_PROTOCOL_VERSION
 
 
 def _build_app_with_agent(updates: list[AgentResponseUpdate], **kwargs: Any) -> FastAPI:
@@ -183,6 +185,32 @@ def test_workflow_sse_round_trip() -> None:
     stream.assert_no_run_error()
     stream.assert_text_messages_balanced()
     stream.assert_has_type("STEP_STARTED")
+
+
+# ── Protocol version ──
+
+
+@pytest.mark.parametrize("target", ["agent", "workflow"])
+def test_run_started_declares_protocol_version(target: str) -> None:
+    """RUN_STARTED declares the AG-UI protocol version on the wire, which ag-ui-protocol has defined since 1.0."""
+
+    @executor(id="greeter")
+    async def greeter(message: Any, ctx: WorkflowContext[Any, str]) -> None:
+        await ctx.yield_output("Hello from workflow!")
+
+    if target == "agent":
+        app = _build_app_with_agent([AgentResponseUpdate(contents=[Content.from_text(text="Hi")], role="assistant")])
+    else:
+        app = _build_app_with_workflow(WorkflowBuilder(start_executor=greeter))
+    response = TestClient(app).post("/", json=USER_PAYLOAD)
+
+    run_started = parse_sse_response(response.content)[0]
+    assert run_started["type"] == "RUN_STARTED"
+    if _AGUI_PROTOCOL_VERSION is None:  # ag-ui-protocol < 1.0 declares no protocol version
+        assert "protocolVersion" not in run_started
+    else:
+        assert _AGUI_PROTOCOL_VERSION.startswith("1.")
+        assert run_started["protocolVersion"] == _AGUI_PROTOCOL_VERSION
 
 
 # ── Error handling ──
