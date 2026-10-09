@@ -2676,6 +2676,36 @@ def test_file_source_is_carried_as_hosted_file():
     assert file_content.additional_properties == {"provider": "openai"}
 
 
+def test_file_source_without_provider_is_forwarded():
+    """A file source that names no provider is forwarded as hosted file content."""
+    messages = agui_messages_to_agent_framework(
+        [{"role": "user", "content": [{"type": "image", "source": {"type": "file", "value": "file-xyz"}}]}]
+    )
+
+    file_content = messages[0].contents[0]
+    assert file_content.type == "hosted_file"
+    assert file_content.file_id == "file-xyz"
+
+
+def test_file_source_from_foreign_provider_is_skipped_with_warning(caplog):
+    """A handle issued by a provider other than OpenAI is dropped with a warning instead of being forwarded."""
+    with caplog.at_level(logging.WARNING):
+        messages = agui_messages_to_agent_framework(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Summarize this"},
+                        {"type": "document", "source": {"type": "file", "value": "file_011", "provider": "anthropic"}},
+                    ],
+                }
+            ]
+        )
+
+    assert [content.type for content in messages[0].contents] == ["text"]
+    assert any("issued by provider 'anthropic'" in record.message for record in caplog.records)
+
+
 def test_file_source_without_handle_is_skipped_with_warning(caplog):
     """A file source with no handle in 'value' is skipped with a warning instead of silently."""
     with caplog.at_level(logging.WARNING):
@@ -2695,8 +2725,8 @@ def test_file_source_without_handle_is_skipped_with_warning(caplog):
     assert any("file source has no provider handle" in record.message for record in caplog.records)
 
 
-def test_tool_content_parts_become_text_and_media_is_dropped_with_warning(caplog):
-    """AG-UI 1.0 ContentPart[] tool content is narrowed to its text; dropped media parts are logged."""
+def test_tool_content_parts_keep_media_and_warn_on_unusable_parts(caplog):
+    """AG-UI 1.0 ContentPart[] tool content keeps text and usable media; only unusable parts are dropped."""
     with caplog.at_level(logging.WARNING):
         messages = agui_messages_to_agent_framework(
             [
@@ -2711,9 +2741,9 @@ def test_tool_content_parts_become_text_and_media_is_dropped_with_warning(caplog
                     "role": "tool",
                     "toolCallId": "call-1",
                     "content": [
-                        {"type": "text", "text": "Rendered "},
+                        {"type": "text", "text": "Rendered the chart."},
                         {"type": "image", "source": {"type": "url", "value": "https://example.com/chart.png"}},
-                        {"type": "text", "text": "the chart."},
+                        {"type": "document", "source": {"type": "file", "value": "file_9", "provider": "google"}},
                     ],
                 },
             ]
@@ -2723,7 +2753,58 @@ def test_tool_content_parts_become_text_and_media_is_dropped_with_warning(caplog
     assert result.type == "function_result"
     assert result.call_id == "call-1"
     assert result.result == "Rendered the chart."
-    assert any("Dropping 1 media part(s) (image)" in record.message for record in caplog.records)
+    assert [(item.type, item.text or item.uri) for item in result.items or []] == [
+        ("text", "Rendered the chart."),
+        ("uri", "https://example.com/chart.png"),
+    ]
+    assert any("Dropping 1 media part(s) (document)" in record.message for record in caplog.records)
+
+
+def test_media_only_tool_content_keeps_its_media(caplog):
+    """A tool result made only of media keeps the media instead of becoming an empty result."""
+    payload = base64.b64encode(b"png-bytes").decode("utf-8")
+    with caplog.at_level(logging.WARNING):
+        messages = agui_messages_to_agent_framework(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "toolCalls": [
+                        {"id": "call-1", "type": "function", "function": {"name": "snap", "arguments": "{}"}}
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "toolCallId": "call-1",
+                    "content": [
+                        {"type": "image", "source": {"type": "data", "value": payload, "mimeType": "image/png"}}
+                    ],
+                },
+            ]
+        )
+
+    result = messages[1].contents[0]
+    assert result.type == "function_result"
+    assert [(item.type, item.media_type) for item in result.items or []] == [("data", "image/png")]
+    assert not caplog.records
+
+
+def test_text_only_tool_content_parts_become_a_string():
+    """Text-only ContentPart[] tool content is narrowed to its concatenated text."""
+    messages = agui_messages_to_agent_framework(
+        [
+            {
+                "role": "tool",
+                "toolCallId": "call-1",
+                "content": [{"type": "text", "text": "Sunny, "}, {"type": "text", "text": "21C"}],
+            }
+        ]
+    )
+
+    result = messages[0].contents[0]
+    assert result.type == "function_result"
+    assert result.result == "Sunny, 21C"
+    assert [item.text for item in result.items or []] == ["Sunny, 21C"]
 
 
 def test_convert_agui_content_string_items_in_list():

@@ -20,6 +20,7 @@ from ag_ui.core import (
 
 from agent_framework_ag_ui import AGUIThreadSnapshot, InMemoryAGUIThreadSnapshotStore
 from agent_framework_ag_ui._snapshot_session import ThreadSnapshotSession
+from agent_framework_ag_ui._utils import _AGUI_PROTOCOL_VERSION
 
 
 async def make_store_with(
@@ -102,6 +103,36 @@ class TestHydrateEvents:
         assert [message.id for message in messages_snapshot.messages] == ["m1"]
         outcome = getattr(events[3], "outcome", None)
         assert getattr(outcome, "type", None) == "interrupt"
+
+    async def test_thread_saved_before_ag_ui_1_0_replays_binary_media(self) -> None:
+        """A thread stored with a pre-1.0 ``binary`` media part still hydrates after upgrading ag-ui-protocol."""
+        snapshot = AGUIThreadSnapshot(
+            messages=[
+                {
+                    "id": "m1",
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is this?"},
+                        {"type": "binary", "mimeType": "image/png", "url": "https://example.com/cat.png"},
+                    ],
+                }
+            ],
+        )
+        store = await make_store_with("user-1", "t1", snapshot)
+        session = await ThreadSnapshotSession.open(store=store, scope="user-1", thread_id="t1")
+
+        events = [event async for event in session.hydrate_events(run_id="r1")]
+
+        messages_snapshot = events[1]
+        assert isinstance(messages_snapshot, MessagesSnapshotEvent)
+        media_part = messages_snapshot.model_dump(by_alias=True, exclude_none=True)["messages"][0]["content"][1]
+        if _AGUI_PROTOCOL_VERSION is None:  # ag-ui-protocol < 1.0 still models the binary part
+            assert media_part["type"] == "binary"
+        else:
+            assert media_part == {
+                "type": "image",
+                "source": {"type": "url", "value": "https://example.com/cat.png", "mimeType": "image/png"},
+            }
 
     async def test_no_stored_snapshot_replays_empty_run(self) -> None:
         store = InMemoryAGUIThreadSnapshotStore()

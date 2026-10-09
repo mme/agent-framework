@@ -21,6 +21,7 @@ from ag_ui.core import (
     StateSnapshotEvent,
 )
 
+from ._message_adapters import _upgrade_legacy_snapshot_media
 from ._run_common import _build_run_finished_event, _build_run_started_event
 from ._snapshots import (
     AGUIThreadSnapshot,
@@ -104,7 +105,9 @@ class ThreadSnapshotSession:
         if snapshot.state is not None:
             yield StateSnapshotEvent(snapshot=snapshot.state)
         if snapshot.messages:
-            yield MessagesSnapshotEvent(messages=_project_host_payload_history(snapshot.messages))  # type: ignore[arg-type]
+            yield MessagesSnapshotEvent(
+                messages=_upgrade_legacy_snapshot_media(_project_host_payload_history(snapshot.messages))  # type: ignore[arg-type]
+            )
         yield _build_run_finished_event(run_id=run_id, thread_id=self._thread_id, interrupts=snapshot.interrupt)
 
     def effective_state(

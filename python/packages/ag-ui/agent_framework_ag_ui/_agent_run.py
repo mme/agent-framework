@@ -88,7 +88,11 @@ from ._approval_execution import (
     InRunPendingToolTransitionOwner,
 )
 from ._approval_state import _APPROVAL_SCOPE_INPUT_KEY, InMemoryAGUIApprovalStateStore, approval_state_thread_id
-from ._message_adapters import _APPROVAL_DECISION_IS_BOOLEAN_KEY, normalize_agui_input_messages
+from ._message_adapters import (
+    _APPROVAL_DECISION_IS_BOOLEAN_KEY,
+    _upgrade_legacy_snapshot_media,
+    normalize_agui_input_messages,
+)
 from ._predictive_state import PredictiveStateHandler
 from ._tooling import collect_server_tools, merge_tools
 from ._run_common import (
@@ -2353,7 +2357,9 @@ def _build_messages_snapshot(
     if flow.snapshot_segments:
         _append_segmented_snapshot_messages(flow, all_messages)
         bounded_messages = _bound_host_payload_history(_persistable_host_payload_history(all_messages))
-        return MessagesSnapshotEvent(messages=_project_host_payload_history(bounded_messages))  # type: ignore[arg-type]
+        return MessagesSnapshotEvent(
+            messages=_upgrade_legacy_snapshot_media(_project_host_payload_history(bounded_messages))  # type: ignore[arg-type]
+        )
 
     # Add assistant message with tool calls only (no content)
     if flow.pending_tool_calls:
@@ -2388,7 +2394,9 @@ def _build_messages_snapshot(
     all_messages.extend(flow.reasoning_messages)
 
     bounded_messages = _bound_host_payload_history(_persistable_host_payload_history(all_messages))
-    return MessagesSnapshotEvent(messages=_project_host_payload_history(bounded_messages))  # type: ignore[arg-type]
+    return MessagesSnapshotEvent(
+        messages=_upgrade_legacy_snapshot_media(_project_host_payload_history(bounded_messages))  # type: ignore[arg-type]
+    )
 
 
 def _safe_point_tool_call_ids(flow: FlowState) -> set[str]:
@@ -2479,7 +2487,9 @@ def _build_safe_point_messages_snapshot(
             all_messages.extend(results)
 
     bounded_messages = _bound_host_payload_history(_persistable_host_payload_history(all_messages))
-    return MessagesSnapshotEvent(messages=_project_host_payload_history(bounded_messages))  # type: ignore[arg-type]
+    return MessagesSnapshotEvent(
+        messages=_upgrade_legacy_snapshot_media(_project_host_payload_history(bounded_messages))  # type: ignore[arg-type]
+    )
 
 
 def _text_events_to_snapshot_messages(events: list[BaseEvent]) -> list[dict[str, Any]]:
