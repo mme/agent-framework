@@ -32,7 +32,21 @@ AG-UI protocol integration for building agent UIs with the AG-UI standard.
   without emitting empty text deltas. Provider `raw_representation` is omitted; `AGUIChatClient` restores the
   annotations on text content. These live custom events are not replayed by `MESSAGES_SNAPSHOT`.
 - Inbound custom event aliases are accepted: `CUSTOM`, `CUSTOM_EVENT`, and `custom_event`.
+- `ag-ui-protocol` is supported from 0.1.19 through 1.x. Code that depends on the installed release gates on
+  `_utils._AGUI_PROTOCOL_VERSION` (`None` before 1.0) rather than importing 1.0-only names.
+- Every `RUN_STARTED` is built by `_run_common._build_run_started_event`, which declares `protocolVersion` when
+  `ag-ui-protocol` 1.0+ is installed. Do not construct `RunStartedEvent` directly.
 - Multimodal user inputs support both legacy (`text`, `binary`) and draft-style (`image`, `audio`, `video`, `document`) shapes.
+  The legacy `binary` input stays accepted because pre-1.0 clients still send it. With `ag-ui-protocol` 1.0,
+  `MESSAGES_SNAPSHOT` echoes media parts in the 1.0 shape, since 1.0 rejects `binary` parts. Every
+  `MessagesSnapshotEvent` passes its messages through `_upgrade_legacy_snapshot_media`, so threads stored before
+  the upgrade still hydrate.
+- An AG-UI 1.0 `file` source (a provider-issued handle in `source.value`) becomes `Content.from_hosted_file` only
+  when its `provider` is absent or `openai`; any other provider's handle is skipped with a warning. Messages are
+  converted before the chat client is known, and OpenAI is the only client that sends hosted files as input.
+- Tool messages whose content is a 1.0 `ContentPart[]` become their concatenated text when text-only; otherwise
+  every part becomes a Content item (media converted like user media), and only unusable parts are dropped with
+  a warning.
 - Interrupted runs complete with `RUN_FINISHED.outcome.type == "interrupt"` and canonical `outcome.interrupts`; do not document or add new flows that depend on the legacy top-level `RUN_FINISHED.interrupt` field.
 - `Interrupt` and `ResumeEntry` come from the `ag-ui-protocol` package (`ag_ui.core`), not from an Agent Framework-specific interrupt model.
 - Tool approval interrupts, including approvals surfaced through workflow `request_info`, advertise standard

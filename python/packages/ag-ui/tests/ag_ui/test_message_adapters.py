@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from ag_ui.core import MessagesSnapshotEvent
 from agent_framework import Content, Message
 
 from agent_framework_ag_ui._message_adapters import (
@@ -23,12 +24,18 @@ from agent_framework_ag_ui._message_adapters import (
 from agent_framework_ag_ui._utils import (
     _AGUI_HOST_PAYLOAD_OMITTED_KEY,
     _AGUI_MCP_TOOL_RESULT_KEY,
+    _AGUI_PROTOCOL_VERSION,
     _AGUI_TOOL_RESULT_HOST_PAYLOAD_KEY,
     _AGUI_TOOL_RESULT_MODEL_CONTENT_KEY,
     _MCP_TOOL_RESULT_HOST_PAYLOAD_KEY,
     _host_payload_history_size,
     _mcp_host_history_fields,
     _model_items_for_agui_replay,
+)
+
+legacy_snapshot_parts = pytest.mark.skipif(
+    _AGUI_PROTOCOL_VERSION is not None,
+    reason="legacy binary snapshot parts are emitted only with ag-ui-protocol < 1.0",
 )
 
 
@@ -1386,6 +1393,7 @@ def test_agui_message_without_id():
     assert messages[0].message_id is None
 
 
+@legacy_snapshot_parts
 def test_agui_snapshot_format_preserves_multimodal_content():
     """Snapshot normalization emits legacy binary parts for multimodal content."""
     normalized = agui_messages_to_snapshot_format(
@@ -1411,6 +1419,7 @@ def test_agui_snapshot_format_preserves_multimodal_content():
     assert content_parts[1]["url"] == "https://example.com/image.png"
 
 
+@legacy_snapshot_parts
 def test_agui_snapshot_format_reads_base64_value_field():
     """Snapshot normalization reads the spec 'value' field for base64 sources."""
     payload = base64.b64encode(b"abc").decode("utf-8")
@@ -1434,6 +1443,7 @@ def test_agui_snapshot_format_reads_base64_value_field():
     assert binary_part["data"] == payload
 
 
+@legacy_snapshot_parts
 def test_agui_snapshot_format_base64_value_preferred_over_data():
     """Snapshot normalization prefers 'value' when both 'value' and 'data' are set."""
     value_payload = base64.b64encode(b"new-spec").decode("utf-8")
@@ -1461,6 +1471,7 @@ def test_agui_snapshot_format_base64_value_preferred_over_data():
     assert binary_part["data"] == value_payload
 
 
+@legacy_snapshot_parts
 def test_agui_snapshot_format_base64_data_field_backward_compat():
     """Snapshot normalization still reads the legacy 'data' field when 'value' is absent."""
     payload = base64.b64encode(b"legacy").decode("utf-8")
@@ -2636,6 +2647,166 @@ def test_convert_agui_content_binary_id():
     assert result.uri == "ag-ui://binary/file123"
 
 
+def test_file_source_is_carried_as_hosted_file():
+    """An AG-UI 1.0 file source keeps its provider handle as hosted file content."""
+    messages = agui_messages_to_agent_framework(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Summarize this"},
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "file",
+                            "value": "file-abc123",
+                            "provider": "openai",
+                            "mimeType": "application/pdf",
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+
+    file_content = messages[0].contents[1]
+    assert file_content.type == "hosted_file"
+    assert file_content.file_id == "file-abc123"
+    assert file_content.media_type == "application/pdf"
+    assert file_content.additional_properties == {"provider": "openai"}
+
+
+def test_file_source_without_provider_is_forwarded():
+    """A file source that names no provider is forwarded as hosted file content."""
+    messages = agui_messages_to_agent_framework(
+        [{"role": "user", "content": [{"type": "image", "source": {"type": "file", "value": "file-xyz"}}]}]
+    )
+
+    file_content = messages[0].contents[0]
+    assert file_content.type == "hosted_file"
+    assert file_content.file_id == "file-xyz"
+
+
+def test_file_source_from_foreign_provider_is_skipped_with_warning(caplog):
+    """A handle issued by a provider other than OpenAI is dropped with a warning instead of being forwarded."""
+    with caplog.at_level(logging.WARNING):
+        messages = agui_messages_to_agent_framework(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Summarize this"},
+                        {"type": "document", "source": {"type": "file", "value": "file_011", "provider": "anthropic"}},
+                    ],
+                }
+            ]
+        )
+
+    assert [content.type for content in messages[0].contents] == ["text"]
+    assert any("issued by provider 'anthropic'" in record.message for record in caplog.records)
+
+
+def test_file_source_without_handle_is_skipped_with_warning(caplog):
+    """A file source with no handle in 'value' is skipped with a warning instead of silently."""
+    with caplog.at_level(logging.WARNING):
+        messages = agui_messages_to_agent_framework(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Summarize this"},
+                        {"type": "document", "source": {"type": "file", "id": "file-abc123"}},
+                    ],
+                }
+            ]
+        )
+
+    assert [content.type for content in messages[0].contents] == ["text"]
+    assert any("file source has no provider handle" in record.message for record in caplog.records)
+
+
+def test_tool_content_parts_keep_media_and_warn_on_unusable_parts(caplog):
+    """AG-UI 1.0 ContentPart[] tool content keeps text and usable media; only unusable parts are dropped."""
+    with caplog.at_level(logging.WARNING):
+        messages = agui_messages_to_agent_framework(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "toolCalls": [
+                        {"id": "call-1", "type": "function", "function": {"name": "render", "arguments": "{}"}}
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "toolCallId": "call-1",
+                    "content": [
+                        {"type": "text", "text": "Rendered the chart."},
+                        {"type": "image", "source": {"type": "url", "value": "https://example.com/chart.png"}},
+                        {"type": "document", "source": {"type": "file", "value": "file_9", "provider": "google"}},
+                    ],
+                },
+            ]
+        )
+
+    result = messages[1].contents[0]
+    assert result.type == "function_result"
+    assert result.call_id == "call-1"
+    assert result.result == "Rendered the chart."
+    assert [(item.type, item.text or item.uri) for item in result.items or []] == [
+        ("text", "Rendered the chart."),
+        ("uri", "https://example.com/chart.png"),
+    ]
+    assert any("Dropping 1 media part(s) (document)" in record.message for record in caplog.records)
+
+
+def test_media_only_tool_content_keeps_its_media(caplog):
+    """A tool result made only of media keeps the media instead of becoming an empty result."""
+    payload = base64.b64encode(b"png-bytes").decode("utf-8")
+    with caplog.at_level(logging.WARNING):
+        messages = agui_messages_to_agent_framework(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "toolCalls": [
+                        {"id": "call-1", "type": "function", "function": {"name": "snap", "arguments": "{}"}}
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "toolCallId": "call-1",
+                    "content": [
+                        {"type": "image", "source": {"type": "data", "value": payload, "mimeType": "image/png"}}
+                    ],
+                },
+            ]
+        )
+
+    result = messages[1].contents[0]
+    assert result.type == "function_result"
+    assert [(item.type, item.media_type) for item in result.items or []] == [("data", "image/png")]
+    assert not caplog.records
+
+
+def test_text_only_tool_content_parts_become_a_string():
+    """Text-only ContentPart[] tool content is narrowed to its concatenated text."""
+    messages = agui_messages_to_agent_framework(
+        [
+            {
+                "role": "tool",
+                "toolCallId": "call-1",
+                "content": [{"type": "text", "text": "Sunny, "}, {"type": "text", "text": "21C"}],
+            }
+        ]
+    )
+
+    result = messages[0].contents[0]
+    assert result.type == "function_result"
+    assert result.result == "Sunny, 21C"
+    assert [item.text for item in result.items or []] == ["Sunny, 21C"]
+
+
 def test_convert_agui_content_string_items_in_list():
     """String items in content list create text Content."""
     from agent_framework_ag_ui._message_adapters import _convert_agui_content_to_framework
@@ -2694,6 +2865,7 @@ def test_convert_agui_content_non_str_non_list_non_none():
 # ── Snapshot normalization edge cases ──
 
 
+@legacy_snapshot_parts
 def test_snapshot_input_image_to_binary():
     """input_image type is normalized to binary in snapshot."""
     result = agui_messages_to_snapshot_format(
@@ -2758,6 +2930,7 @@ def test_snapshot_text_only_list_collapsed():
     assert result[0]["content"] == "Hello World"
 
 
+@legacy_snapshot_parts
 def test_snapshot_legacy_binary_data_and_id():
     """Legacy binary part with data and id fields."""
     result = agui_messages_to_snapshot_format(
@@ -2777,6 +2950,47 @@ def test_snapshot_legacy_binary_data_and_id():
     assert binary_part["type"] == "binary"
     assert binary_part["data"] == "base64data"
     assert binary_part["id"] == "file1"
+
+
+@pytest.mark.skipif(_AGUI_PROTOCOL_VERSION is None, reason="AG-UI 1.0 media parts need ag-ui-protocol >= 1.0")
+@pytest.mark.parametrize(
+    ("part", "expected"),
+    [
+        pytest.param(
+            {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png", "mime_type": "image/png"}},
+            {"type": "image", "source": {"type": "url", "value": "https://example.com/a.png", "mimeType": "image/png"}},
+            id="legacy-url-field",
+        ),
+        pytest.param(
+            {"type": "image", "source": {"type": "base64", "value": "bmV3", "data": "b2xk", "mimeType": "image/png"}},
+            {"type": "image", "source": {"type": "data", "value": "bmV3", "mimeType": "image/png"}},
+            id="base64-value-preferred",
+        ),
+        pytest.param(
+            {"type": "input_image", "source": {"type": "url", "url": "https://example.com/img.png"}},
+            {"type": "image", "source": {"type": "url", "value": "https://example.com/img.png"}},
+            id="input-image",
+        ),
+        pytest.param(
+            {"type": "binary", "data": "base64data", "id": "file1", "mimeType": "audio/wav"},
+            {"type": "audio", "source": {"type": "data", "value": "base64data", "mimeType": "audio/wav"}},
+            id="legacy-binary",
+        ),
+        pytest.param(
+            {"type": "document", "id": "part-1", "source": {"type": "file", "value": "file-1", "provider": "openai"}},
+            {"type": "document", "id": "part-1", "source": {"type": "file", "value": "file-1", "provider": "openai"}},
+            id="file-source",
+        ),
+    ],
+)
+def test_snapshot_emits_ag_ui_1_0_media_parts(part: dict[str, Any], expected: dict[str, Any]):
+    """With ag-ui-protocol 1.0, snapshot media parts use the 1.0 shape, which MESSAGES_SNAPSHOT accepts."""
+    result = agui_messages_to_snapshot_format(
+        [{"id": "user-1", "role": "user", "content": [{"type": "text", "text": "Caption"}, part]}]
+    )
+
+    assert result[0]["content"][1] == expected
+    MessagesSnapshotEvent(messages=result)  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]
 
 
 # ── Message conversion edge cases ──

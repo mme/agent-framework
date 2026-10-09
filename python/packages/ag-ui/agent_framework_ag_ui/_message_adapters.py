@@ -20,6 +20,7 @@ from ._state import TOOL_RESULT_DISPLAY_KEY
 from ._utils import (
     _AGUI_HOST_PAYLOAD_OMITTED_KEY,
     _AGUI_MCP_TOOL_RESULT_KEY,
+    _AGUI_PROTOCOL_VERSION,
     _AGUI_TOOL_RESULT_HOST_PAYLOAD_KEY,
     _AGUI_TOOL_RESULT_MODEL_CONTENT_KEY,
     _MAX_MCP_HOST_PAYLOAD_HISTORY_SIZE_BYTES,
@@ -44,6 +45,12 @@ from ._utils import (
 logger = logging.getLogger(__name__)
 _VALID_CONTENT_TYPES = frozenset(get_args(ContentType))
 _APPROVAL_DECISION_IS_BOOLEAN_KEY = "_ag_ui_approval_decision_is_boolean"
+_MEDIA_PART_TYPES = frozenset({"image", "audio", "video", "document"})
+_CONTENT_PART_TYPES = _MEDIA_PART_TYPES | {"text"}
+# File-source providers whose handles are forwarded. The adapter converts messages before it knows which chat
+# client will run them, so it forwards only handles the OpenAI client, the one Agent Framework client that sends
+# hosted files as input, can resolve. A file source without a provider is forwarded as well.
+_FORWARDED_FILE_SOURCE_PROVIDERS = frozenset({"openai"})
 
 
 def _append_synthetic_tool_results(
@@ -402,14 +409,25 @@ def _extract_multimodal_source_fields(
             url = cast(str | None, source_dict.get("value") or source_dict.get("url") or source_dict.get("uri"))
         elif source_type in {"base64", "data", "binary"}:
             data = cast(str | None, source_dict.get("value") or source_dict.get("data"))
-        elif source_type in {"id", "file"}:
+        elif source_type == "id":
             binary_id = cast(str | None, source_dict.get("id"))
+        elif source_type == "file":
+            # A provider-issued handle is neither bytes nor a fetchable URL; see _file_source.
+            pass
         else:
             url = cast(str | None, source_dict.get("url") or source_dict.get("uri") or url)
             data = cast(str | None, source_dict.get("value") or source_dict.get("data") or data)
             binary_id = cast(str | None, source_dict.get("id") or binary_id)
 
     return url, data, binary_id, mime_type
+
+
+def _file_source(part: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the AG-UI 1.0 file source of a media part, if it has one."""
+    source = part.get("source")
+    if isinstance(source, dict) and str(cast(dict[str, Any], source).get("type", "")).lower() == "file":
+        return cast(dict[str, Any], source)
+    return None
 
 
 def _parse_multimodal_media_part(part: dict[str, Any]) -> Content | None:
@@ -425,6 +443,30 @@ def _parse_multimodal_media_part(part: dict[str, Any]) -> Content | None:
             "document": "application/octet-stream",
             "binary": "application/octet-stream",
         }.get(part_type, "application/octet-stream")
+
+    file_source = _file_source(part)
+    if file_source is not None:
+        # The handle names bytes already held by the provider that issued it, and only that provider can resolve
+        # it. Forward it as hosted file content only when it can be an OpenAI handle; drop it otherwise, as AG-UI
+        # asks of a consumer that cannot use the handle.
+        handle = file_source.get("value")
+        if not isinstance(handle, str) or not handle:
+            logger.warning("Skipping AG-UI %s part: its file source has no provider handle in 'value'.", part_type)
+            return None
+        provider = file_source.get("provider")
+        if isinstance(provider, str) and provider and provider.lower() not in _FORWARDED_FILE_SOURCE_PROVIDERS:
+            logger.warning(
+                "Skipping AG-UI %s part: its file source was issued by provider %r, whose handles Agent Framework "
+                "cannot forward to a provider that resolves them.",
+                part_type,
+                provider,
+            )
+            return None
+        return Content.from_hosted_file(
+            file_id=handle,
+            media_type=mime_type,
+            additional_properties={"provider": provider} if isinstance(provider, str) and provider else None,
+        )
 
     if isinstance(url, str) and url:
         return Content.from_uri(uri=url, media_type=mime_type)
@@ -505,6 +547,70 @@ def _convert_agui_content_to_framework(content: Any) -> list[Content]:
     return [Content.from_text(text=str(content))]
 
 
+def _snapshot_media_part(part: dict[str, Any], part_type: str) -> dict[str, Any] | None:
+    """Convert a multimodal part to the AG-UI 1.0 media part shape (``image``/``audio``/``video``/``document``).
+
+    AG-UI 1.0 removed the legacy ``binary`` part, so a snapshot holding one fails validation. A legacy part is
+    mapped to the media type its MIME type names. Returns ``None`` for a legacy part that only references a
+    binary ``id``, which has no 1.0 representation.
+    """
+    url, data, _, mime_type = _extract_multimodal_source_fields(part)
+    if part_type not in _MEDIA_PART_TYPES:
+        top_level_type = (mime_type or "").split("/", 1)[0].lower()
+        part_type = top_level_type if top_level_type in {"image", "audio", "video"} else "document"
+
+    source: dict[str, Any]
+    if (file_source := _file_source(part)) is not None:
+        source = dict(file_source)
+    elif isinstance(url, str) and url:
+        source = {"type": "url", "value": url}
+    elif isinstance(data, str) and data:
+        source = {"type": "url", "value": data} if data.startswith("data:") else {"type": "data", "value": data}
+        if source["type"] == "data" and not mime_type:
+            mime_type = "application/octet-stream"
+    else:
+        logger.warning("Omitting an AG-UI %s part without a url or data source from MESSAGES_SNAPSHOT.", part_type)
+        return None
+    if mime_type and source["type"] != "file":
+        source["mimeType"] = mime_type
+
+    normalized: dict[str, Any] = {"type": part_type, "source": source}
+    if str(part.get("type", "")).lower() in _MEDIA_PART_TYPES:
+        for key in ("id", "metadata"):
+            if key in part:
+                normalized[key] = part[key]
+    return normalized
+
+
+def _upgrade_legacy_snapshot_media(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rewrite legacy ``binary`` parts in snapshot messages to the AG-UI 1.0 media part shape.
+
+    Thread snapshots saved with ag-ui-protocol < 1.0 hold media as ``binary`` parts, which a 1.0
+    ``MessagesSnapshotEvent`` rejects. Every snapshot event passes its messages through here so a thread saved
+    before an upgrade still replays. Messages without ``binary`` parts are returned as they are.
+    """
+    if _AGUI_PROTOCOL_VERSION is None:
+        return messages
+    upgraded: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list) or not any(
+            isinstance(part, dict) and cast(dict[str, Any], part).get("type") == "binary"
+            for part in cast(list[Any], content)
+        ):
+            upgraded.append(message)
+            continue
+        parts: list[Any] = []
+        for part in cast(list[Any], content):
+            if isinstance(part, dict) and cast(dict[str, Any], part).get("type") == "binary":
+                if (media_part := _snapshot_media_part(cast(dict[str, Any], part), "binary")) is not None:
+                    parts.append(media_part)
+            else:
+                parts.append(part)
+        upgraded.append({**message, "content": parts})
+    return upgraded
+
+
 def _normalize_snapshot_content(content: Any) -> Any:
     """Normalize AG-UI message content for snapshot payloads.
 
@@ -549,15 +655,18 @@ def _normalize_snapshot_content(content: Any) -> Any:
                 part["type"] = "text"
                 part_type = "text"
             elif part_type == "input_image":
-                part["type"] = "binary"
-                part_type = "binary"
+                part_type = "binary" if _AGUI_PROTOCOL_VERSION is None else "image"
+                part["type"] = part_type
 
             if part_type == "text":
                 text_parts.append(str(part.get("text", "")))
             else:
                 has_non_text_parts = True
                 if part_type in {"binary", "image", "audio", "video", "document"}:
-                    normalized_parts.append(_legacy_binary_part(part))
+                    if _AGUI_PROTOCOL_VERSION is None:
+                        normalized_parts.append(_legacy_binary_part(part))
+                    elif (media_part := _snapshot_media_part(part, part_type)) is not None:
+                        normalized_parts.append(media_part)
                     continue
 
             if "mime_type" in part and "mimeType" not in part:
@@ -580,6 +689,41 @@ def _normalize_snapshot_content(content: Any) -> Any:
         return ""
 
     return content
+
+
+def _tool_content_parts_to_result(content: list[Any], tool_call_id: str) -> str | list[Content] | None:
+    """Convert an AG-UI 1.0 ``ContentPart[]`` tool result to a function result.
+
+    Text-only content becomes its concatenated text. When media parts are present, every part becomes a Content
+    item (media parts the same way as user media), so chat clients with rich function output receive the media.
+    Parts that cannot be represented are dropped with a warning. Returns ``None`` when ``content`` is not a list
+    of content parts, so other list payloads keep their existing handling.
+    """
+    if not content or not all(
+        isinstance(part, dict) and cast(dict[str, Any], part).get("type") in _CONTENT_PART_TYPES for part in content
+    ):
+        return None
+    parts = cast(list[dict[str, Any]], content)
+    if all(part["type"] == "text" for part in parts):
+        return "".join(str(part.get("text", "")) for part in parts)
+
+    items: list[Content] = []
+    dropped: list[str] = []
+    for part in parts:
+        if part["type"] == "text":
+            items.append(Content.from_text(text=str(part.get("text", ""))))
+        elif (media_content := _parse_multimodal_media_part(part)) is not None:
+            items.append(media_content)
+        else:
+            dropped.append(str(part["type"]))
+    if dropped:
+        logger.warning(
+            "Dropping %d media part(s) (%s) without a usable source from the result of tool call %r.",
+            len(dropped),
+            ", ".join(dropped),
+            tool_call_id,
+        )
+    return items or ""
 
 
 def normalize_agui_input_messages(
@@ -749,6 +893,10 @@ def agui_messages_to_agent_framework(messages: list[dict[str, Any]]) -> list[Mes
             result_content = msg.get("content")
             if result_content is None:
                 result_content = msg.get("result", "")
+            elif isinstance(result_content, list):
+                converted = _tool_content_parts_to_result(cast(list[Any], result_content), str(tool_call_id))
+                if converted is not None:
+                    result_content = converted
 
             # Distinguish approval payloads from actual tool results
             parsed: dict[str, Any] | None = None
